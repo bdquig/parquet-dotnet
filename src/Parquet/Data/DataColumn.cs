@@ -1,123 +1,181 @@
 ﻿using System;
-using System.Buffers;
+using System.Collections.Generic;
 using System.Linq;
+using Parquet.Extensions;
+using Parquet.Schema;
 
-namespace Parquet.Data
-{
-   /// <summary>
-   /// The primary low-level structure to hold data for a parqut column.
-   /// Handles internal data composition/decomposition to enrich with custom data Parquet format requires.
-   /// </summary>
-   public class DataColumn
-   {
-      private readonly IDataTypeHandler _dataTypeHandler;
+namespace Parquet.Data {
+    /// <summary>
+    /// The primary low-level structure to hold data for a parquet column.
+    /// Handles internal data composition/decomposition to enrich with custom data Parquet format requires.
+    /// </summary>
+    public class DataColumn {
 
-      private DataColumn(DataField field)
-      {
-         Field = field ?? throw new ArgumentNullException(nameof(field));
+        private Array? _data;
 
-         _dataTypeHandler = DataTypeFactory.Match(field.DataType);
-      }
+        private DataColumn(DataField field, Array data, int[]? definitionLevels, int[]? repetitionLevels, bool dataMayContainNulls) {
+            if(field is null)
+                throw new ArgumentNullException(nameof(field));
+            field.EnsureAttachedToSchema(nameof(field));
+            if(data is null)
+                throw new ArgumentNullException(nameof(data));
 
-      /// <summary>
-      /// 
-      /// </summary>
-      /// <param name="field"></param>
-      /// <param name="data"></param>
-      /// <param name="repetitionLevels"></param>
-      public DataColumn(DataField field, Array data, int[] repetitionLevels = null) : this(field)
-      {
-         Data = data ?? throw new ArgumentNullException(nameof(data));
+            // validate repetition levels
+            if(field.MaxRepetitionLevel == 0 && repetitionLevels != null)
+                throw new ArgumentException($"this column must not have any repetition levels", nameof(repetitionLevels));
+            else if(field.MaxRepetitionLevel > 0 && repetitionLevels == null && data.Length > 0)
+                throw new ArgumentNullException(nameof(repetitionLevels), $"repetition levels are required (RL={field.MaxRepetitionLevel})");
 
-         RepetitionLevels = repetitionLevels;
-      }
+            // validate definiton levels
+            if(field.MaxDefinitionLevel == 0 && definitionLevels != null) {
+                throw new ArgumentException($"this column must not have any definition levels", nameof(definitionLevels));
+            } else {
 
-      internal DataColumn(DataField field,
-         Array definedData,
-         int[] definitionLevels, int maxDefinitionLevel,
-         int[] repetitionLevels, int maxRepetitionLevel,
-         Array dictionary,
-         int[] dictionaryIndexes) : this(field)
-      {
-         Data = definedData;
+                // validate data type of data
+                Type expectedType = dataMayContainNulls ? field.ClrNullableIfHasNullsType : field.ClrType;
+                Type actualType = data.GetType().GetElementType()!;
+                if(actualType != expectedType)
+                    throw new ArgumentException($"expected {expectedType}[] but passed {actualType}[]", nameof(data));
 
-         // 1. Apply definitions
-         if (definitionLevels != null)
-         {
-            Data = _dataTypeHandler.UnpackDefinitions(Data, definitionLevels, maxDefinitionLevel);
-         }
+                if(dataMayContainNulls && field.MaxDefinitionLevel > 0) {
+                    int nullCount = data.CalculateNullCountFast(0, data.Length);
+                    _data = data;
+                    DefinedData = field.CreateArray(data.Length - nullCount);
+                    DefinitionLevels = new int[data.Length];
+                    data.PackNullsFast(0, data.Length, DefinedData, DefinitionLevels, field.MaxDefinitionLevel);
+                    Statistics.NullCount = nullCount;
+                } else {
 
-         // 2. Apply repetitions
-         RepetitionLevels = repetitionLevels;
-      }
+                    if(field.MaxDefinitionLevel > 0 && definitionLevels == null && data.Length > 0) {
+                        throw new ArgumentNullException(nameof(definitionLevels), $"definition levels are required (DL={field.MaxDefinitionLevel})");
+                    }
 
-      /// <summary>
-      /// Column data where definition levels are already applied
-      /// </summary>
-      public Array Data { get; private set; }
+                    DefinedData = data;
+                    DefinitionLevels = definitionLevels;
+                    Statistics.NullCount = definitionLevels == null
+                        ? 0
+                        : definitionLevels.Count(l => l != field.MaxDefinitionLevel);
+                }
+            }
 
-      /// <summary>
-      /// Repetition levels if any.
-      /// </summary>
-      public int[] RepetitionLevels { get; private set; }
+            Field = field ?? throw new ArgumentNullException(nameof(field));
+            RepetitionLevels = repetitionLevels;
+        }
 
-      /// <summary>
-      /// Data field
-      /// </summary>
-      public DataField Field { get; private set; }
+        /// <summary>
+        /// Creates a new instance of DataColumn from essential parts of Parquet data.
+        /// </summary>
+        /// <param name="field">Data field associated with this data column.</param>
+        /// <param name="definedData">Raw data as it, without definition levels applied</param>
+        /// <param name="repetitionLevels">Repetition levels, if required.</param>
+        /// <param name="definitionLevels">Definition levels, if required.</param>
+        /// <exception cref="ArgumentNullException"></exception>
+        public DataColumn(DataField field, Array definedData, int[]? definitionLevels, int[]? repetitionLevels)
+            : this(field, definedData, definitionLevels, repetitionLevels, false) {
+        }
 
-      /// <summary>
-      /// When true, this field has repetitions. It doesn't mean that it's an array though. This property simply checks that
-      /// repetition levels are present on this column.
-      /// </summary>
-      public bool HasRepetitions => RepetitionLevels != null;
 
-      /// <summary>
-      /// Basic statistics for this data column (populated on read)
-      /// </summary>
-      public DataColumnStatistics Statistics { get; internal set; } = new DataColumnStatistics(0, 0, null, null);
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="field"></param>
+        /// <param name="data"></param>
+        /// <param name="repetitionLevels"></param>
+        public DataColumn(DataField field, Array data, int[]? repetitionLevels = null)
+            : this(field, data, null, repetitionLevels, true) {
+        }
 
-      internal ArrayView PackDefinitions(int maxDefinitionLevel, out int[] pooledDefinitionLevels, out int definitionLevelCount, out int nullCount)
-      {
-         pooledDefinitionLevels = ArrayPool<int>.Shared.Rent(Data.Length);
-         definitionLevelCount = Data.Length;
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="field"></param>
+        /// <param name="data"></param>
+        public DataColumn(DataField field, Array data) : this(field, data, null, null, true) {
 
-         bool isNullable = Field.ClrType.IsNullable() || Data.GetType().GetElementType().IsNullable();
+        }
 
-         if (!Field.HasNulls || !isNullable)
-         {
-            SetPooledDefinitionLevels(maxDefinitionLevel, pooledDefinitionLevels);
-            nullCount = 0; //definitely no nulls here
-            return new ArrayView(Data);
-         }
+        /// <summary>
+        /// Data field
+        /// </summary>
+        public DataField Field { get; private set; }
 
-         return _dataTypeHandler.PackDefinitions(Data, maxDefinitionLevel, out pooledDefinitionLevels, out definitionLevelCount, out nullCount);
-      }
+        /// <summary>
+        /// Defined data. If definition levels are present, they are not applied here.
+        /// </summary>
+        public Array DefinedData { get; private set; }
 
-      void SetPooledDefinitionLevels(int maxDefinitionLevel, int[] pooledDefinitionLevels)
-      {
-         for (int i = 0; i < Data.Length; i++)
-         {
-            pooledDefinitionLevels[i] = maxDefinitionLevel;
-         }
-      }
+        /// <summary>
+        /// Column data where definition levels are already applied
+        /// </summary>
+        public Array Data {
+            get {
+                if(!HasDefinitions)
+                    return DefinedData;
 
-      internal long CalculateRowCount()
-      {
-         if(Field.MaxRepetitionLevel > 0)
-         {
-            return RepetitionLevels.Count(rl => rl == 0);
-         }
+                if(_data == null) {
+                    _data = Field.UnpackDefinitions(DefinedData, DefinitionLevels);
+                }
 
-         return Data.Length;
-      }
+                return _data;
+            }
+        }
 
-      /// <summary>
-      /// pretty print
-      /// </summary>
-      public override string ToString()
-      {
-         return Field.ToString();
-      }
-   }
+        /// <summary>
+        /// Definition levels, if present
+        /// </summary>
+        public int[]? DefinitionLevels { get; }
+
+        /// <summary>
+        /// Repetition levels if any.
+        /// </summary>
+        public int[]? RepetitionLevels { get; }
+
+        /// <summary>
+        /// When true, this field has repetitions. It doesn't mean that it's an array though. This property simply checks that
+        /// repetition levels are present on this column.
+        /// </summary>
+        public bool HasRepetitions => RepetitionLevels != null;
+
+        /// <summary>
+        /// When true, this column has definition levels
+        /// </summary>
+        public bool HasDefinitions => DefinitionLevels != null;
+
+        /// <summary>
+        /// Basic statistics for this data column (populated only on read)
+        /// </summary>
+        public DataColumnStatistics Statistics { get; internal set; } =
+            new DataColumnStatistics(null, null, null, null);
+
+        /// <summary>
+        /// Number of actual values in this column, including nulls and null/empty lists polyfills.
+        /// </summary>
+        public int NumValues => DefinitionLevels?.Length ?? DefinedData.Length;
+
+        /// <summary>
+        /// Casts <see cref="Data"/> to <see cref="Span{T}"/>
+        /// </summary>
+        /// <exception cref="InvalidOperationException">When T is invalid type</exception>
+        public Span<T> AsSpan<T>(int? offset = null, int? count = null) {
+            if(Data is not T[] ar)
+                throw new InvalidOperationException($"data is not castable to {typeof(T)}[]");
+
+            Span<T> span = ar.AsSpan();
+            if(offset != null)
+                span = span.Slice(offset.Value);
+            if(count != null)
+                span = span.Slice(0, count.Value);
+            return span;
+        }
+
+        internal long CalculateRowCount() =>
+            Field.MaxRepetitionLevel > 0
+                ? RepetitionLevels?.Count(rl => rl == 0) ?? 0
+                : NumValues;
+
+        /// <inheritdoc/>
+        public override string ToString() {
+            return Field.ToString();
+        }
+    }
 }

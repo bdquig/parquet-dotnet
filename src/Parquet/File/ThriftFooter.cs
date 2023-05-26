@@ -2,363 +2,316 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using Parquet.Data;
-using Parquet.File.Data;
-using Parquet.Thrift;
+using System.Threading;
+using System.Threading.Tasks;
+using Parquet.Encodings;
+using Parquet.Schema;
+using Parquet.Meta;
+using Parquet.Meta.Proto;
 
-namespace Parquet.File
-{
-   class ThriftFooter
-   {
-      private readonly Thrift.FileMetaData _fileMeta;
-      private readonly ThriftSchemaTree _tree;
+namespace Parquet.File {
+    class ThriftFooter {
+        private readonly FileMetaData _fileMeta;
+        private readonly ThriftSchemaTree _tree;
 
-      public ThriftFooter(Thrift.FileMetaData fileMeta)
-      {
-         _fileMeta = fileMeta ?? throw new ArgumentNullException(nameof(fileMeta));
-         _tree = new ThriftSchemaTree(_fileMeta.Schema);
-      }
+        internal static ThriftFooter Empty => new();
 
-      public ThriftFooter(Schema schema, long totalRowCount)
-      {
-         if (schema == null)
-         {
-            throw new ArgumentNullException(nameof(schema));
-         }
+        internal ThriftFooter() {
+            _fileMeta = new FileMetaData();
+            _tree= new ThriftSchemaTree();
+        }
 
-         _fileMeta = CreateThriftSchema(schema);
-         _fileMeta.Num_rows = totalRowCount;
+        public ThriftFooter(FileMetaData fileMeta) {
+            _fileMeta = fileMeta ?? throw new ArgumentNullException(nameof(fileMeta));
+            _tree = new ThriftSchemaTree(_fileMeta.Schema);
+        }
 
-         _fileMeta.Created_by = $"Parquet.Net version %Version% (build %Git.LongCommitHash%)";
-         _tree = new ThriftSchemaTree(_fileMeta.Schema);
-      }
+        internal static ParquetSchema Parse(params SchemaElement[] elements) {
 
-      public Dictionary<string, string> CustomMetadata
-      {
-         set
-         {
-            _fileMeta.Key_value_metadata = null;
-            if (value == null || value.Count == 0) return;
+            var slst = new List<SchemaElement> {
+                new SchemaElement { Name = "root", NumChildren = 1 },
+            };
+            slst.AddRange(elements);
 
-            _fileMeta.Key_value_metadata = value
-               .Select(kvp => new Thrift.KeyValue(kvp.Key) { Value = kvp.Value })
-               .ToList();
-         }
-         get
-         {
-            if (_fileMeta.Key_value_metadata == null || _fileMeta.Key_value_metadata.Count == 0) return new Dictionary<string, string>();
+            return new ThriftFooter(new FileMetaData {
+                Schema = slst
+            }).CreateModelSchema(new ParquetOptions());
+        }
 
-            return _fileMeta.Key_value_metadata.ToDictionary(kv => kv.Key, kv => kv.Value);
-         }
-      }
-
-      public void Add(long totalRowCount)
-      {
-         _fileMeta.Num_rows += totalRowCount;
-      }
-
-      public long Write(ThriftStream thriftStream)
-      {
-         return thriftStream.Write(_fileMeta);
-      }
-
-      public Thrift.SchemaElement GetSchemaElement(Thrift.ColumnChunk columnChunk)
-      {
-         if (columnChunk == null)
-         {
-            throw new ArgumentNullException(nameof(columnChunk));
-         }
-
-         List<string> path = columnChunk.Meta_data.Path_in_schema;
-
-         int i = 0;
-         foreach (string pp in path)
-         {
-            while(i < _fileMeta.Schema.Count)
-            {
-               if (_fileMeta.Schema[i].Name == pp) break;
-
-               i++;
-            }
-         }
-
-         return _fileMeta.Schema[i];
-      }
-
-      public List<string> GetPath(Thrift.SchemaElement schemaElement)
-      {
-         var path = new List<string>();
-
-         ThriftSchemaTree.Node wrapped = _tree.Find(schemaElement);
-         while(wrapped.parent != null)
-         {
-            path.Add(wrapped.element.Name);
-            wrapped = wrapped.parent;
-         }
-
-         path.Reverse();
-         return path;
-      }
-
-      // could use value tuple, would that nuget ref be ok to bring in?
-      readonly Dictionary<StringListComparer, Tuple<int, int>> _memoizedLevels = new Dictionary<StringListComparer, Tuple<int, int>>();
-
-      public void GetLevels(Thrift.ColumnChunk columnChunk, out int maxRepetitionLevel, out int maxDefinitionLevel)
-      {
-         maxRepetitionLevel = 0;
-         maxDefinitionLevel = 0;
-
-         int i = 0;
-         List<string> path = columnChunk.Meta_data.Path_in_schema;
-
-         var comparer = new StringListComparer(path);
-         if (_memoizedLevels.TryGetValue(comparer, out Tuple<int, int> t))
-         {
-            maxRepetitionLevel = t.Item1;
-            maxDefinitionLevel = t.Item2;
-            return;
-         }
-
-         int fieldCount = _fileMeta.Schema.Count;
-
-         foreach (string pp in path)
-         {
-            while(i < fieldCount)
-            {
-               SchemaElement schemaElement = _fileMeta.Schema[i];
-               if(string.CompareOrdinal(schemaElement.Name, pp) == 0)
-               {
-                  Thrift.SchemaElement se = schemaElement;
-
-                  bool repeated = (se.__isset.repetition_type && se.Repetition_type == Thrift.FieldRepetitionType.REPEATED);
-                  bool defined = (se.Repetition_type == Thrift.FieldRepetitionType.REQUIRED);
-
-                  if (repeated) maxRepetitionLevel += 1;
-                  if (!defined) maxDefinitionLevel += 1;
-
-                  break;
-               }
-
-               i++;
-            }
-         }
-         
-         _memoizedLevels.Add(comparer, Tuple.Create(maxRepetitionLevel, maxDefinitionLevel));
-      }
-
-      public Thrift.SchemaElement[] GetWriteableSchema()
-      {
-         return _fileMeta.Schema.Where(tse => tse.__isset.type).ToArray();
-      }
-
-      public Thrift.RowGroup AddRowGroup()
-      {
-         var rg = new Thrift.RowGroup();
-         if (_fileMeta.Row_groups == null) _fileMeta.Row_groups = new List<Thrift.RowGroup>();
-         _fileMeta.Row_groups.Add(rg);
-         return rg;
-      }
-
-      public Thrift.ColumnChunk CreateColumnChunk(CompressionMethod compression, Stream output, Thrift.Type columnType, List<string> path, int valuesCount)
-      {
-         Thrift.CompressionCodec codec = DataFactory.GetThriftCompression(compression);
-
-         var chunk = new Thrift.ColumnChunk();
-         long startPos = output.Position;
-         chunk.File_offset = startPos;
-         chunk.Meta_data = new Thrift.ColumnMetaData();
-         chunk.Meta_data.Num_values = valuesCount;
-         chunk.Meta_data.Type = columnType;
-         chunk.Meta_data.Codec = codec;
-         chunk.Meta_data.Data_page_offset = startPos;
-         chunk.Meta_data.Encodings = new List<Thrift.Encoding>
-         {
-            Thrift.Encoding.RLE,
-            Thrift.Encoding.BIT_PACKED,
-            Thrift.Encoding.PLAIN
-         };
-         chunk.Meta_data.Path_in_schema = path;
-         chunk.Meta_data.Statistics = new Thrift.Statistics();
-
-         return chunk;
-      }
-
-      public Thrift.PageHeader CreateDataPage(int valueCount)
-      {
-         var ph = new Thrift.PageHeader(Thrift.PageType.DATA_PAGE, 0, 0);
-         ph.Data_page_header = new Thrift.DataPageHeader
-         {
-            Encoding = Thrift.Encoding.PLAIN,
-            Definition_level_encoding = Thrift.Encoding.RLE,
-            Repetition_level_encoding = Thrift.Encoding.RLE,
-            Num_values = valueCount,
-            Statistics = new Thrift.Statistics()
-         };
-
-         return ph;
-      }
-
-      #region [ Conversion to Model Schema ]
-
-      public Schema CreateModelSchema(ParquetOptions formatOptions)
-      {
-         int si = 0;
-         Thrift.SchemaElement tse = _fileMeta.Schema[si++];
-         var container = new List<Field>();
-
-         CreateModelSchema(null, container, tse.Num_children, ref si, formatOptions);
-
-         return new Schema(container);
-      }
-
-      private void CreateModelSchema(string path, IList<Field> container, int childCount, ref int si, ParquetOptions formatOptions)
-      {
-         for (int i = 0; i < childCount && si < _fileMeta.Schema.Count; i++)
-         {
-            Thrift.SchemaElement tse = _fileMeta.Schema[si];
-            IDataTypeHandler dth = DataTypeFactory.Match(tse, formatOptions);
-
-            if(dth == null)
-            {
-               throw new InvalidOperationException($"cannot find data type handler to create model schema for {tse.Describe()}");
+        public ThriftFooter(ParquetSchema schema, long totalRowCount) {
+            if(schema == null) {
+                throw new ArgumentNullException(nameof(schema));
             }
 
-            Field se = dth.CreateSchemaElement(_fileMeta.Schema, ref si, out int ownedChildCount);
+            _fileMeta = CreateThriftSchema(schema);
+            _fileMeta.NumRows = totalRowCount;
 
-            se.Path = string.Join(Schema.PathSeparator, new[] { path, se.Path ?? se.Name }.Where(p => p != null));
 
-            if (ownedChildCount > 0)
-            {
-               var childContainer = new List<Field>();
-               CreateModelSchema(se.Path, childContainer, ownedChildCount, ref si, formatOptions);
-               foreach(Field cse in childContainer)
-               {
-                  se.Assign(cse);
-               }
+            // Looks like Spark is sensitive about this format. See https://github.com/aloneguid/parquet-dotnet/issues/261
+#if DEBUG
+            _fileMeta.CreatedBy = "Parquet.Net version LocalDev (build Local)";
+#else
+            _fileMeta.CreatedBy = $"Parquet.Net version {Globals.Version} (build {Globals.GithubSha})";
+#endif
+            _tree = new ThriftSchemaTree(_fileMeta.Schema);
+        }
+
+        public Dictionary<string, string> CustomMetadata {
+            set {
+                _fileMeta.KeyValueMetadata = null;
+                if(value == null || value.Count == 0)
+                    return;
+
+                _fileMeta.KeyValueMetadata = value
+                   .Select(kvp => new KeyValue{ Key = kvp.Key, Value = kvp.Value })
+                   .ToList();
+            }
+            get {
+                if(_fileMeta.KeyValueMetadata == null || _fileMeta.KeyValueMetadata.Count == 0)
+                    return new Dictionary<string, string>();
+
+                return _fileMeta.KeyValueMetadata.ToDictionary(kv => kv.Key, kv => kv.Value!);
+            }
+        }
+
+        public void Add(long totalRowCount) {
+            _fileMeta.NumRows += totalRowCount;
+        }
+
+        public async Task<long> WriteAsync(Stream s, CancellationToken cancellationToken = default) {
+            using var ms = new MemoryStream();
+            _fileMeta.Write(new ThriftCompactProtocolWriter(ms));
+            ms.Position = 0;
+            await ms.CopyToAsync(s);
+            return ms.Length;
+        }
+
+        public SchemaElement? GetSchemaElement(ColumnChunk columnChunk) {
+            if(columnChunk == null) {
+                throw new ArgumentNullException(nameof(columnChunk));
             }
 
+            var findPath = new FieldPath(columnChunk.MetaData!.PathInSchema);
+            return _tree.Find(findPath)?.element;
+        }
 
-            container.Add(se);
-         }
-      }
+        public FieldPath GetPath(SchemaElement schemaElement) {
+            var path = new List<string>();
 
-      private void ThrowNoHandler(Thrift.SchemaElement tse)
-      {
-         string ct = tse.__isset.converted_type
-            ? $" ({tse.Converted_type})"
-            : null;
-
-         string t = tse.__isset.type
-            ? $"'{tse.Type}'"
-            : "<unspecified>";
-
-         throw new NotSupportedException($"cannot find data type handler for schema element '{tse.Name}' (type: {t}{ct})");
-      }
-
-      #endregion
-
-      #region [ Convertion from Model Schema ]
-
-      public Thrift.FileMetaData CreateThriftSchema(Schema schema)
-      {
-         var meta = new Thrift.FileMetaData();
-         meta.Version = 1;
-         meta.Schema = new List<Thrift.SchemaElement>();
-         meta.Row_groups = new List<Thrift.RowGroup>();
-
-         Thrift.SchemaElement root = AddRoot(meta.Schema);
-         CreateThriftSchema(schema.Fields, root, meta.Schema);
-
-         return meta;
-      }
-
-      private Thrift.SchemaElement AddRoot(IList<Thrift.SchemaElement> container)
-      {
-         var root = new Thrift.SchemaElement("root");
-         container.Add(root);
-         return root;
-      }
-
-      private void CreateThriftSchema(IEnumerable<Field> ses, Thrift.SchemaElement parent, IList<Thrift.SchemaElement> container)
-      {
-         foreach(Field se in ses)
-         {
-            IDataTypeHandler handler = DataTypeFactory.Match(se);
-
-            //todo: check that handler is found indeed
-
-            handler.CreateThrift(se, parent, container);
-         }
-      }
-
-      #endregion
-
-      #region [ Helpers ]
-
-      class ThriftSchemaTree
-      {
-         readonly Dictionary<SchemaElement, Node> _memoizedFindResults = new Dictionary<SchemaElement, Node>();
-         
-         public class Node
-         {
-            public Thrift.SchemaElement element;
-            public List<Node> children;
-            public Node parent;
-         }
-
-         public Node root;
-
-         public ThriftSchemaTree(List<Thrift.SchemaElement> schema)
-         {
-            root = new Node { element = schema[0] };
-            int i = 1;
-
-            BuildSchema(root, schema, root.element.Num_children, ref i);
-         }
-
-         public Node Find(Thrift.SchemaElement tse)
-         {
-            if (_memoizedFindResults.TryGetValue(tse, out Node node))
-            {
-               return node;
-            }
-            node = Find(root, tse);
-            _memoizedFindResults.Add(tse, node);
-            return node;
-         }
-
-         private Node Find(Node root, Thrift.SchemaElement tse)
-         {
-            foreach(Node child in root.children)
-            {
-               if (child.element == tse) return child;
-
-               if(child.children != null)
-               {
-                  Node cf = Find(child, tse);
-                  if (cf != null) return cf;
-               }
+            ThriftSchemaTree.Node? wrapped = _tree.Find(schemaElement);
+            while(wrapped?.parent != null) {
+                string? name = wrapped.element?.Name;
+                if(name != null)
+                    path.Add(name);
+                wrapped = wrapped.parent;
             }
 
-            return null;
-         }
+            path.Reverse();
+            return new FieldPath(path);
+        }
 
-         private void BuildSchema(Node parent, List<Thrift.SchemaElement> schema, int count, ref int i)
-         {
-            parent.children = new List<Node>();
-            for(int ic = 0; ic < count; ic++)
-            {
-               Thrift.SchemaElement child = schema[i++];
-               var node = new Node { element = child, parent = parent };
-               parent.children.Add(node);
-               if(child.Num_children > 0)
-               {
-                  BuildSchema(node, schema, child.Num_children, ref i);
-               }
+        public SchemaElement[] GetWriteableSchema() {
+            return _fileMeta.Schema.Where(tse => tse.Type != null).ToArray();
+        }
+
+        public RowGroup AddRowGroup() {
+            var rg = new RowGroup();
+            _fileMeta.RowGroups ??= new List<RowGroup>();
+            _fileMeta.RowGroups.Add(rg);
+            return rg;
+        }
+
+        public ColumnChunk CreateColumnChunk(CompressionMethod compression, System.IO.Stream output,
+            Parquet.Meta.Type columnType, FieldPath path, int valuesCount) {
+            CompressionCodec codec = (CompressionCodec)(int)compression;
+
+            var chunk = new ColumnChunk();
+            long startPos = output.Position;
+            chunk.FileOffset = startPos;
+            chunk.MetaData = new ColumnMetaData();
+            chunk.MetaData.NumValues = valuesCount;
+            chunk.MetaData.Type = columnType;
+            chunk.MetaData.Codec = codec;
+            chunk.MetaData.DataPageOffset = startPos;
+            chunk.MetaData.Encodings = new List<Encoding> {
+                Encoding.RLE,
+                Encoding.BIT_PACKED,
+                Encoding.PLAIN
+            };
+            chunk.MetaData!.PathInSchema = path.ToList();
+            chunk.MetaData!.Statistics = new Statistics();
+
+            return chunk;
+        }
+
+        public PageHeader CreateDataPage(int valueCount, bool isDictionary) => 
+            new PageHeader {
+                Type = PageType.DATA_PAGE,
+                DataPageHeader = new DataPageHeader {
+                    Encoding = isDictionary ? Encoding.PLAIN_DICTIONARY : Encoding.PLAIN,
+                    DefinitionLevelEncoding = Encoding.RLE,
+                    RepetitionLevelEncoding = Encoding.RLE,
+                    NumValues = valueCount,
+                    Statistics = new Statistics()
+                }
+            };
+
+        public PageHeader CreateDictionaryPage(int numValues) {
+            var ph = new PageHeader { 
+                Type = PageType.DICTIONARY_PAGE,
+                DictionaryPageHeader = new DictionaryPageHeader {
+                    Encoding = Encoding.PLAIN_DICTIONARY,
+                    NumValues = numValues
+                }};
+            return ph;
+        }
+
+#region [ Conversion to Model Schema ]
+
+        public ParquetSchema CreateModelSchema(ParquetOptions formatOptions) {
+            int si = 0;
+            SchemaElement tse = _fileMeta.Schema[si++];
+            var container = new List<Field>();
+
+            CreateModelSchema(null, container, tse.NumChildren ?? 0, ref si, formatOptions);
+
+            return new ParquetSchema(container);
+        }
+
+        private void CreateModelSchema(FieldPath? path, IList<Field> container, int childCount, ref int si, ParquetOptions formatOptions) {
+            for(int i = 0; i < childCount && si < _fileMeta.Schema.Count; i++) {
+                Field? se = SchemaEncoder.Decode(_fileMeta.Schema, formatOptions, ref si, out int ownedChildCount);
+                if(se == null)
+                    throw new InvalidOperationException($"cannot decode schema for field {_fileMeta.Schema[si]}");
+
+                List<string> npath = path?.ToList() ?? new List<string>();
+                if(se.Path != null) npath.AddRange(se.Path.ToList());
+                else npath.Add(se.Name);
+                se.Path = new FieldPath(npath);
+
+                if(ownedChildCount > 0) {
+                    var childContainer = new List<Field>();
+                    CreateModelSchema(se.Path, childContainer, ownedChildCount, ref si, formatOptions);
+                    foreach(Field cse in childContainer) {
+                        se.Assign(cse);
+                    }
+                }
+
+                container.Add(se);
             }
-         }
-      }
+        }
 
-      #endregion
-   }
+#endregion
+
+#region [ Convertion from Model Schema ]
+
+        public FileMetaData CreateThriftSchema(ParquetSchema schema) {
+            var meta = new FileMetaData();
+            meta.Version = 1;
+            meta.Schema = new List<SchemaElement>();
+            meta.RowGroups = new List<RowGroup>();
+
+            SchemaElement root = ThriftFooter.AddRoot(meta.Schema);
+            foreach(Field se in schema.Fields) {
+                SchemaEncoder.Encode(se, root, meta.Schema);
+            }
+
+            return meta;
+        }
+
+
+        private static SchemaElement AddRoot(IList<SchemaElement> container) {
+            var root = new SchemaElement { Name = "root" };
+            container.Add(root);
+            return root;
+        }
+
+#endregion
+
+#region [ Helpers ]
+
+        class ThriftSchemaTree {
+            readonly Dictionary<SchemaElement, Node?> _memoizedFindResults = 
+                new Dictionary<SchemaElement, Node?>(new ReferenceEqualityComparer<SchemaElement>());
+
+            public class Node {
+                public SchemaElement? element;
+                public List<Node>? children;
+                public Node? parent;
+            }
+
+            public Node root;
+
+            internal ThriftSchemaTree() {
+                root = new Node();
+            }
+
+            public ThriftSchemaTree(List<SchemaElement> schema) {
+                root = new Node { element = schema[0] };
+                int i = 1;
+
+                BuildSchema(root, schema, root.element.NumChildren ?? 0, ref i);
+            }
+
+            public Node? Find(SchemaElement tse) {
+                if(_memoizedFindResults.TryGetValue(tse, out Node? node)) {
+                    return node;
+                }
+                node = Find(root, tse);
+                _memoizedFindResults.Add(tse, node);
+                return node;
+            }
+
+            private Node? Find(Node root, SchemaElement tse) {
+                if(root.children != null) {
+                    foreach(Node child in root.children) {
+                        if(child.element == tse)
+                            return child;
+
+                        if(child.children != null) {
+                            Node? cf = Find(child, tse);
+                            if(cf != null)
+                                return cf;
+                        }
+                    }
+                }
+
+                return null;
+            }
+
+            public Node? Find(FieldPath path) {
+                if(path.Length == 0) return null;
+                return Find(root, path);
+            }
+
+            private Node? Find(Node root, FieldPath path) {
+                if(root.children != null) {
+                    foreach(Node child in root.children) {
+                        if(child.element?.Name == path.FirstPart) {
+                            if(path.Length == 1)
+                                return child;
+
+                            return Find(child, new FieldPath(path.ToList().Skip(1)));
+                        }
+                    }
+                }
+
+                return null;
+            }
+
+            private void BuildSchema(Node parent, List<SchemaElement> schema, int count, ref int i) {
+                parent.children = new List<Node>();
+                for(int ic = 0; ic < count; ic++) {
+                    SchemaElement child = schema[i++];
+                    var node = new Node { element = child, parent = parent };
+                    parent.children.Add(node);
+                    if(child.NumChildren > 0) {
+                        BuildSchema(node, schema, child.NumChildren ?? 0, ref i);
+                    }
+                }
+            }
+        }
+
+#endregion
+    }
 }

@@ -1,160 +1,160 @@
-﻿using System.Buffers;
-using System.Collections.Generic;
+﻿using System;
 using System.IO;
-using System.Linq;
-using System.Text;
+using System.IO.Compression;
+using System.Threading;
+using System.Threading.Tasks;
+using IronCompress;
+using Microsoft.IO;
 using Parquet.Data;
-using Parquet.File.Streams;
-using Parquet.File.Values;
+using Parquet.Encodings;
+using Parquet.Meta;
+using Parquet.Schema;
 
-namespace Parquet.File
-{
-   class DataColumnWriter
-   {
-      private readonly Stream _stream;
-      private readonly ThriftStream _thriftStream;
-      private readonly ThriftFooter _footer;
-      private readonly Thrift.SchemaElement _schemaElement;
-      private readonly CompressionMethod _compressionMethod;
-      private readonly int _compressionLevel;
-      private readonly int _rowCount;
+namespace Parquet.File {
+    class DataColumnWriter {
+        private readonly Stream _stream;
+        private readonly ThriftFooter _footer;
+        private readonly SchemaElement _schemaElement;
+        private readonly CompressionMethod _compressionMethod;
+        private readonly CompressionLevel _compressionLevel;
+        private readonly ParquetOptions _options;
+        private static readonly RecyclableMemoryStreamManager _rmsMgr = new RecyclableMemoryStreamManager();
 
-      private struct PageTag
-      {
-         public int HeaderSize;
-         public Thrift.PageHeader HeaderMeta;
-      }
+        public DataColumnWriter(
+           Stream stream,
+           ThriftFooter footer,
+           SchemaElement schemaElement,
+           CompressionMethod compressionMethod,
+           ParquetOptions options,
+           CompressionLevel compressionLevel) {
+            _stream = stream;
+            _footer = footer;
+            _schemaElement = schemaElement;
+            _compressionMethod = compressionMethod;
+            _compressionLevel = compressionLevel;
+            _options = options;
+        }
 
-      public DataColumnWriter(
-         Stream stream,
-         ThriftStream thriftStream,
-         ThriftFooter footer,
-         Thrift.SchemaElement schemaElement,
-         CompressionMethod compressionMethod,
-         int compressionLevel,
-         int rowCount)
-      {
-         _stream = stream;
-         _thriftStream = thriftStream;
-         _footer = footer;
-         _schemaElement = schemaElement;
-         _compressionMethod = compressionMethod;
-         _compressionLevel = compressionLevel;
-         _rowCount = rowCount;
-      }
+        public async Task<ColumnChunk> WriteAsync(
+            FieldPath fullPath, DataColumn column,
+            CancellationToken cancellationToken = default) {
 
-      public Thrift.ColumnChunk Write(List<string> path, DataColumn column, IDataTypeHandler dataTypeHandler)
-      {
-         Thrift.ColumnChunk chunk = _footer.CreateColumnChunk(_compressionMethod, _stream, _schemaElement.Type, path, 0);
-         Thrift.PageHeader ph = _footer.CreateDataPage(column.Data.Length);
-         _footer.GetLevels(chunk, out int maxRepetitionLevel, out int maxDefinitionLevel);
+            // Num_values in the chunk does include null values - I have validated this by dumping spark-generated file.
+            ColumnChunk chunk = _footer.CreateColumnChunk(
+                _compressionMethod, _stream, _schemaElement.Type!.Value, fullPath, column.NumValues);
 
-         List<PageTag> pages = WriteColumn(column, _schemaElement, dataTypeHandler, maxRepetitionLevel, maxDefinitionLevel);
-         //generate stats for column chunk
-         chunk.Meta_data.Statistics = column.Statistics.ToThriftStatistics(dataTypeHandler, _schemaElement);
+            ColumnSizes columnSizes = await WriteColumnAsync(column, _schemaElement,
+                cancellationToken);
+            //generate stats for column chunk
+            chunk.MetaData!.Statistics = column.Statistics.ToThriftStatistics(_schemaElement);
 
-         //this count must be set to number of all values in the column, including nulls.
-         //for hierarchy/repeated columns this is a count of flattened list, including nulls.
-         chunk.Meta_data.Num_values = ph.Data_page_header.Num_values;
-         ph.Data_page_header.Statistics = chunk.Meta_data.Statistics;   //simply copy statistics to page header
+            //the following counters must include both data size and header size
+            chunk.MetaData.TotalCompressedSize = columnSizes.CompressedSize;
+            chunk.MetaData.TotalUncompressedSize = columnSizes.UncompressedSize;
 
-         //the following counters must include both data size and header size
-         chunk.Meta_data.Total_compressed_size = pages.Sum(p => p.HeaderMeta.Compressed_page_size + p.HeaderSize);
-         chunk.Meta_data.Total_uncompressed_size = pages.Sum(p => p.HeaderMeta.Uncompressed_page_size + p.HeaderSize);
+            return chunk;
+        }
 
-         return chunk;
-      }
+        class ColumnSizes {
+            public int CompressedSize;
+            public int UncompressedSize;
+        }
 
-      private List<PageTag> WriteColumn(DataColumn column,
-         Thrift.SchemaElement tse,
-         IDataTypeHandler dataTypeHandler,
-         int maxRepetitionLevel,
-         int maxDefinitionLevel)
-      {
-         var pages = new List<PageTag>();
-
-         /*
-          * Page header must preceeed actual data (compressed or not) however it contains both
-          * the uncompressed and compressed data size which we don't know! This somehow limits
-          * the write efficiency.
-          */
-
-
-         using (var ms = new MemoryStream())
-         {
-            Thrift.PageHeader dataPageHeader = _footer.CreateDataPage(column.Data.Length);
-
-            //chain streams together so we have real streaming instead of wasting undefraggable LOH memory
-            using (GapStream pageStream = DataStreamFactory.CreateWriter(ms, _compressionMethod, _compressionLevel, true))
-            {
-               using (var writer = new BinaryWriter(pageStream, Encoding.UTF8, true))
-               {
-                  if (column.RepetitionLevels != null)
-                  {
-                     WriteLevels(writer, column.RepetitionLevels, column.RepetitionLevels.Length, maxRepetitionLevel);
-                  }
-
-                  ArrayView data = new ArrayView(column.Data);
-
-                  if (maxDefinitionLevel > 0)
-                  {
-                     data = column.PackDefinitions(maxDefinitionLevel, out int[] definitionLevels, out int definitionLevelsLength, out int nullCount);
-
-                     //last chance to capture null count as null data is compressed now
-                     column.Statistics.NullCount = nullCount;
-
-                     try
-                     {
-                        WriteLevels(writer, definitionLevels, definitionLevelsLength, maxDefinitionLevel);
-                     }
-                     finally
-                     {
-                        if (definitionLevels != null)
-                        {
-                           ArrayPool<int>.Shared.Return(definitionLevels);
-                        }
-                     }
-                  }
-                  else
-                  {
-                     //no defitions means no nulls
-                     column.Statistics.NullCount = 0;
-                  }
-
-                  dataTypeHandler.Write(tse, writer, data, column.Statistics);
-
-                  writer.Flush();
-               }
-
-               pageStream.Flush();   //extremely important to flush the stream as some compression algorithms don't finish writing
-               pageStream.MarkWriteFinished();
-               dataPageHeader.Uncompressed_page_size = (int)pageStream.Position;
-            }
-            dataPageHeader.Compressed_page_size = (int)ms.Position;
+        private async Task CompressAndWriteAsync(
+            PageHeader ph, MemoryStream data,
+            ColumnSizes cs,
+            CancellationToken cancellationToken) {
+            
+            using IronCompress.IronCompressResult compressedData = _compressionMethod == CompressionMethod.None
+                ? new IronCompress.IronCompressResult(data.ToArray(), Codec.Snappy, false)
+                : Compressor.Compress(_compressionMethod, data.ToArray(), _compressionLevel);
+            
+            ph.UncompressedPageSize = (int)data.Length;
+            ph.CompressedPageSize = compressedData.AsSpan().Length;
 
             //write the header in
-            dataPageHeader.Data_page_header.Statistics = column.Statistics.ToThriftStatistics(dataTypeHandler, _schemaElement);
-            int headerSize = _thriftStream.Write(dataPageHeader);
-            ms.Position = 0;
-            ms.CopyTo(_stream);
+            using var headerMs = new MemoryStream();
+            ph.Write(new Meta.Proto.ThriftCompactProtocolWriter(headerMs));
+            int headerSize = (int)headerMs.Length;
+            headerMs.Position = 0;
+            _stream.Flush();
+            await headerMs.CopyToAsync(_stream);
 
+            // write data
+#if NETSTANDARD2_0
+                byte[] tmp = compressedData.AsSpan().ToArray();
+                _stream.Write(tmp, 0, tmp.Length);
+#else
+            _stream.Write(compressedData);
+#endif
 
-            var dataTag = new PageTag
-            {
-               HeaderMeta = dataPageHeader,
-               HeaderSize = headerSize
-            };
+            cs.CompressedSize += headerSize;
+            cs.UncompressedSize += headerSize;
 
-            pages.Add(dataTag);
-         }
+            cs.CompressedSize += ph.CompressedPageSize;
+            cs.UncompressedSize += ph.UncompressedPageSize;
+        }
 
-         return pages;
-      }
+        private async Task<ColumnSizes> WriteColumnAsync(DataColumn column,
+           SchemaElement tse,
+           CancellationToken cancellationToken = default) {
 
-      private void WriteLevels(BinaryWriter writer, int[] levels, int count, int maxLevel)
-      {
-         int bitWidth = maxLevel.GetBitWidth();
-         RunLengthBitPackingHybridValuesWriter.WriteForwardOnly(writer, bitWidth, levels, count);
-      }
-   }
+            column.Field.EnsureAttachedToSchema(nameof(column));
+
+            var r = new ColumnSizes();
+
+            /*
+             * Page header must preceeed actual data (compressed or not) however it contains both
+             * the uncompressed and compressed data size which we don't know! This somehow limits
+             * the write efficiency.
+             */
+
+            using var pc = new PackedColumn(column);
+            pc.Pack(_options.UseDictionaryEncoding, _options.DictionaryEncodingThreshold);
+
+            // dictionary page
+            if(pc.HasDictionary) {
+                PageHeader ph = _footer.CreateDictionaryPage(pc.Dictionary!.Length);
+                using MemoryStream ms = _rmsMgr.GetStream();
+                ParquetPlainEncoder.Encode(pc.Dictionary, 0, pc.Dictionary.Length,
+                       tse,
+                       ms, column.Statistics);
+
+                await CompressAndWriteAsync(ph, ms, r, cancellationToken);
+            }
+
+            // data page
+            using(MemoryStream ms = _rmsMgr.GetStream()) {
+                // data page Num_values also does include NULLs
+                PageHeader ph = _footer.CreateDataPage(column.NumValues, pc.HasDictionary);
+                if(pc.HasRepetitionLevels) {
+                    WriteLevels(ms, pc.RepetitionLevels!, pc.RepetitionLevels!.Length, column.Field.MaxRepetitionLevel);
+                }
+                if(pc.HasDefinitionLevels) {
+                    WriteLevels(ms, pc.DefinitionLevels!, column.DefinitionLevels!.Length, column.Field.MaxDefinitionLevel);
+                }
+
+                if(pc.HasDictionary) {
+                    // dictionary indexes are always encoded with RLE
+                    int[] indexes = pc.GetDictionaryIndexes(out int indexesLength)!;
+                    int bitWidth = pc.Dictionary!.Length.GetBitWidth();
+                    ms.WriteByte((byte)bitWidth);   // bit width is stored as 1 byte before encoded data
+                    RleBitpackedHybridEncoder.Encode(ms, indexes.AsSpan(0, indexesLength), bitWidth);
+                } else {
+                    Array data = pc.GetPlainData(out int offset, out int count);
+                    ParquetPlainEncoder.Encode(data, offset, count, tse, ms, pc.HasDictionary ? null : column.Statistics);
+                }
+
+                ph.DataPageHeader!.Statistics = column.Statistics.ToThriftStatistics(tse);
+                await CompressAndWriteAsync(ph, ms, r, cancellationToken);
+            }
+
+            return r;
+        }
+
+        private static void WriteLevels(Stream s, Span<int> levels, int count, int maxValue) {
+            int bitWidth = maxValue.GetBitWidth();
+            RleBitpackedHybridEncoder.EncodeWithLength(s, bitWidth, levels.Slice(0, count));
+        }
+    }
 }
